@@ -1,0 +1,616 @@
+name: Automatic-Version-Update
+on:
+  workflow_dispatch:
+    inputs:
+      max_retry_rounds:
+        description: '最大重试轮次，防止死循环，推荐3~5'
+        required: true
+        default: '5'
+      per_release_delay_sec:
+        description: '每个Release处理完成等待秒数，防API限流，推荐3~10'
+        required: true
+        default: '3'
+      force_full_sync:
+        description: '强制重新全量同步(忽略.sync_done标记文件，重新扫描全部历史release)【仅手动触发生效，定时任务永远增量】'
+        type: boolean
+        default: false
+      skip_draft_release:
+        description: '是否跳过上游草稿Draft Release（推荐true）'
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 4,16 * * *'
+jobs:
+  sync_releases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 公共API函数，一次性定义，所有step可复用
+      GH_API_FUNC: |
+        gh_api() {
+          local max_attempts=3
+          local attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            local resp_file=$(mktemp)
+            local http_code=$(curl -s -w "%{http_code}" -o "$resp_file" -H "Authorization: token $GH_TOKEN" "$@")
+            if [ "$http_code" -eq 429 ]; then
+              local reset=$(jq -r '.["X-RateLimit-Reset"] // 0' "$resp_file")
+              local now=$(date +%s)
+              local sleep_sec=$(( reset - now + 5 ))
+              if [ $sleep_sec -lt 5 ]; then sleep_sec=10; fi
+              echo "⚠️ 触发GitHub API 429限流，等待 ${sleep_sec}s 继续..."
+              sleep $sleep_sec
+              attempt=$((attempt+1))
+              rm -f "$resp_file"
+              continue
+            fi
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+              cat "$resp_file"
+              rm -f "$resp_file"
+              return 0
+            fi
+            echo "⚠️ API请求失败，HTTP=$http_code，重试 $attempt/$max_attempts"
+            rm -f "$resp_file"
+            attempt=$((attempt+1))
+            sleep 3
+          done
+          echo "❌ API多次重试失败"
+          return 1
+        }
+        git_tag_exists() {
+          local t="$1"
+          for i in {1..3}; do
+            if git ls-remote --tags --refs https://github.com/$TARGET_REPO "refs/tags/$t" | grep -Fq "${t}$"; then
+              return 0
+            fi
+            sleep 2
+          done
+          return 1
+        }
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v5
+      - name: 🔥 清理Runner预装软件，释放磁盘空间
+        run: |
+          echo "====清理前磁盘信息===="
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /opt/microsoft
+          sudo docker system prune -af || true
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          echo "====清理后磁盘信息===="
+          df -h
+      - name: 安装依赖 jq / gh / file / curl / bc
+        run: |
+          sudo apt update
+          sudo apt install -y gh jq file curl bc
+      - name: 读取输入参数 & 识别上游仓库
+        id: detect_upstream
+        run: |
+          set -o pipefail
+          eval "$GH_API_FUNC"
+          TARGET_REPO="${{ github.repository }}"
+          echo "TARGET_REPO=$TARGET_REPO" >> $GITHUB_ENV
+          REPO_INFO=$(gh_api "https://api.github.com/repos/$TARGET_REPO")
+          DESCRIPTION=$(echo "$REPO_INFO" | jq -r '.description // ""')
+          echo "仓库原始描述: $DESCRIPTION"
+          # =========【修复】换回原版grep -oP稳定提取 mirror:owner/repo =========
+          SRC_REPO=$(echo "$DESCRIPTION" | grep -oP 'mirror:\K[\w\-\/\.]+')
+          if [ -z "$SRC_REPO" ]; then
+            echo "❌ 在仓库描述中未找到 mirror:owner/repo 标记！"
+            echo "👉 请去仓库主页设置，仓库简介填写类似：mirror:owner/repo"
+            exit 1
+          fi
+          echo "SOURCE_REPO=$SRC_REPO" >> $GITHUB_ENV
+          echo "✅ 自动识别：当前仓库 $TARGET_REPO → 上游源仓库 $SRC_REPO"
+          # 参数解析修复：定时任务无inputs，给默认值
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            MAX_RETRY=${{ github.event.inputs.max_retry_rounds }}
+            DELAY_SEC=${{ github.event.inputs.per_release_delay_sec }}
+            FORCE_FULL=${{ github.event.inputs.force_full_sync }}
+            SKIP_DRAFT=${{ github.event.inputs.skip_draft_release }}
+          else
+            MAX_RETRY="5"
+            DELAY_SEC="3"
+            FORCE_FULL="false"
+            SKIP_DRAFT="true"
+          fi
+          echo "MAX_RETRY_ROUNDS=$MAX_RETRY" >> $GITHUB_ENV
+          echo "PER_RELEASE_DELAY=$DELAY_SEC" >> $GITHUB_ENV
+          echo "FORCE_FULL=$FORCE_FULL" >> $GITHUB_ENV
+          echo "SKIP_DRAFT=$SKIP_DRAFT" >> $GITHUB_ENV
+          # =========核心模式判断=========
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "=== 【定时任务触发】强制增量模式，仅检测上游最新release ==="
+            echo "RUN_MODE=LATEST_ONLY" >> $GITHUB_ENV
+          else
+            if [[ "$FORCE_FULL" == "true" || ! -f .sync_done ]];then
+              echo "RUN_MODE=FULL" >> $GITHUB_ENV
+              echo "=== 【手动触发】进入【全量初始化模式】，遍历所有release ==="
+            else
+              echo "RUN_MODE=LATEST_ONLY" >> $GITHUB_ENV
+              echo "=== 【手动触发】进入【增量模式】，仅检测上游最新release ==="
+            fi
+          fi
+      - name: 全量初始化模式 - 遍历全部Release同步
+        if: env.RUN_MODE == 'FULL'
+        run: |
+          set -o pipefail
+          trap 'rm -f failed_tags.txt page.json releases.json releases_all.json; rm -rf tmp_*' EXIT
+          eval "$GH_API_FUNC"
+          SRC_REPO=${{ env.SOURCE_REPO }}
+          TARGET_REPO=${{ env.TARGET_REPO }}
+          DELAY=${{ env.PER_RELEASE_DELAY }}
+          SKIP_DRAFT=${{ env.SKIP_DRAFT }}
+          # =========修复分页JSON拼接BUG=========
+          ALL_RELEASES=()
+          PAGE=1
+          while true; do
+            page_json=$(gh_api "https://api.github.com/repos/$SRC_REPO/releases?per_page=100&page=$PAGE")
+            CNT=$(echo "$page_json" | jq 'length')
+            if [ "$CNT" -eq 0 ]; then
+              break
+            fi
+            ALL_RELEASES+=("$page_json")
+            PAGE=$((PAGE+1))
+          done
+          # 合并为完整JSON数组
+          releases_all_json=$(jq -s 'flatten' <<< "${ALL_RELEASES[*]}")
+          echo "$releases_all_json" > releases_all.json
+          if [ "$(jq 'length' releases_all.json)" -eq 0 ]; then
+            echo "⚠️ 上游仓库无任何Release，直接退出"
+            exit 0
+          fi
+          if [[ "${SKIP_DRAFT}" == "true" ]];then
+            jq 'map(select(.draft != true)) | sort_by(.published_at)' releases_all.json > releases.json
+          else
+            jq 'sort_by(.published_at)' releases_all.json > releases.json
+          fi
+          LATEST_REL=$(jq -c 'last' releases.json)
+          LATEST_TAG=$(echo "$LATEST_REL" | jq -r '.tag_name')
+          echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
+          echo "✅ 按发布时间识别上游最新Release TAG: $LATEST_TAG"
+          > failed_tags.txt
+          echo "===== 全量同步【顺序：按发布时间 最早版本 → 最新版本】 ====="
+          echo "👉 规则：旧tag只要存在直接跳过，仅最新TAG执行差异对比，支持更新附件/正文"
+          jq -c '.[]' releases.json | while read -r rel; do
+            TAG=$(echo "$rel" | jq -r '.tag_name')
+            NAME=$(echo "$rel" | jq -r '.name')
+            BODY=$(echo "$rel" | jq -r '.body')
+            PRERELEASE=$(echo "$rel" | jq -r '.prerelease')
+            HAS_ASSETS=$(echo "$rel" | jq -r '.assets | length > 0')
+            ASSETS_RAW=$(echo "$rel" | jq -c '.assets | select(length >0) | .[]')
+            echo -e "\n========== 正在处理 TAG: $TAG =========="
+            echo "Is prerelease: $PRERELEASE"
+            if [ "$TAG" != "$LATEST_TAG" ]; then
+              echo "ℹ️ $TAG 不是上游最新版本，仅检查tag是否存在，不对比附件正文"
+              if git_tag_exists "$TAG"; then
+                echo "✅ $TAG 已存在，直接跳过"
+                sleep $DELAY
+                continue
+              fi
+              echo "➕ $TAG 不存在，新建Release"
+            else
+              echo "🔥 $TAG 是上游最新版本，执行完整差异校验（正文+附件）"
+              UPSTREAM_ASSET_SIGN=$(echo "$rel" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
+              TAG_EXISTS=0
+              if git_tag_exists "$TAG"; then
+                TAG_EXISTS=1
+                TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
+                TARGET_BODY=$(echo "$TARGET_REL" | jq -r '.body')
+                TARGET_ASSET_SIGN=$(echo "$TARGET_REL" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
+                if [ "$BODY" = "$TARGET_BODY" ] && [ "$UPSTREAM_ASSET_SIGN" = "$TARGET_ASSET_SIGN" ]; then
+                  echo "✅ 最新TAG正文&附件完全一致，无需更新，跳过"
+                  sleep $DELAY
+                  continue
+                fi
+                echo "🔍 最新TAG检测变更，准备更新Release"
+              fi
+            fi
+            RELEASE_CREATED=0
+            release_args=("$TAG" --title "$NAME" --notes-file -)
+            if [ "$PRERELEASE" = "true" ];then
+              release_args+=(--prerelease)
+            fi
+            if [ "$TAG" = "$LATEST_TAG" ]; then
+              if git_tag_exists "$TAG"; then
+                echo "🔧 更新已有最新Release $TAG，清空旧附件"
+                TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
+                echo "$TARGET_REL" | jq -r '.assets[].url' | while read -r ASSET_URL; do
+                  gh api --method DELETE "$ASSET_URL"
+                done
+                if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                  echo "✅ Release基础信息更新成功"
+                  RELEASE_CREATED=1
+                else
+                  echo "❌ 更新Release基础信息失败"
+                fi
+              else
+                echo "➕ 创建最新Release $TAG"
+                if echo "$BODY" | gh release create "${release_args[@]}"; then
+                  echo "✅ Release创建成功"
+                  RELEASE_CREATED=1
+                else
+                  echo "❌ 创建Release基础信息失败"
+                fi
+              fi
+            else
+              echo "➕ 创建Release $TAG"
+              if echo "$BODY" | gh release create "${release_args[@]}"; then
+                echo "✅ Release创建成功"
+                RELEASE_CREATED=1
+              else
+                echo "❌ 创建Release基础信息失败"
+              fi
+            fi
+            if [ "$RELEASE_CREATED" -ne 1 ]; then
+              echo "⚠️ $TAG Release本体创建失败，加入失败列表"
+              echo "$TAG" >> failed_tags.txt
+              sleep $DELAY
+              continue
+            fi
+            DL_OK=1
+            if [ "$HAS_ASSETS" = "true" ]; then
+              while read -r asset; do
+                [ -z "$asset" ] && continue
+                SPACE_AVAIL=$(df -P . | awk 'NR==2 {print $4*512/1024/1024}')
+                SPACE_AVAIL=${SPACE_AVAIL:-0}
+                echo "当前可用磁盘: ${SPACE_AVAIL} MB"
+                if (( $(echo "$SPACE_AVAIL < 2048" | bc -l) )); then
+                  echo "❌ 磁盘剩余不足2GB，停止当前TAG处理"
+                  DL_OK=0
+                  break
+                fi
+                FNAME=$(echo "$asset" | jq -r '.name')
+                DL_URL=$(echo "$asset" | jq -r '.browser_download_url')
+                SRC_SIZE=$(echo "$asset" | jq -r '.size')
+                echo "下载文件: $FNAME | 上游大小: $SRC_SIZE bytes"
+                if ! curl --retry 3 --retry-delay 5 --connect-timeout 60 --max-time 1800 -L -O "$DL_URL"; then
+                  echo "❌ curl下载返回非0退出码"
+                  DL_OK=0
+                  rm -f "$FNAME"
+                  continue
+                fi
+                LOCAL_SIZE=$(stat -c %s "$FNAME" 2>/dev/null || echo 0)
+                if [ "$LOCAL_SIZE" != "$SRC_SIZE" ]; then
+                  echo "❌ $FNAME 文件大小不一致，下载损坏"
+                  DL_OK=0
+                  rm -f "$FNAME"
+                  continue
+                fi
+                echo "✅ $FNAME 校验完成，开始上传到Release"
+                if ! gh release upload --clobber "$TAG" "$FNAME"; then
+                  echo "❌ gh upload 上传失败"
+                  DL_OK=0
+                fi
+                echo "✅ $FNAME 上传完成，删除本地文件释放磁盘"
+                rm -f "$FNAME"
+              done < <(echo "$ASSETS_RAW")
+            fi
+            if [ "$DL_OK" -eq 0 ]; then
+              echo "⚠️ $TAG 部分附件下载/上传失败，加入重试列表"
+              echo "$TAG" >> failed_tags.txt
+              sleep $DELAY
+              continue
+            fi
+            echo "🎉 $TAG Release处理全部完成"
+            echo "⏳ 等待 ${DELAY}s 再处理下一个版本"
+            sleep $DELAY
+          done
+      - name: 全量模式 - 多轮循环重试剩余失败TAG
+        if: env.RUN_MODE == 'FULL'
+        run: |
+          set -o pipefail
+          trap 'rm -f failed_tags.txt page.json releases.json releases_all.json _tmp_sort.txt retry_tags.txt; rm -rf tmp_*' EXIT
+          eval "$GH_API_FUNC"
+          SRC_REPO=${{ env.SOURCE_REPO }}
+          TARGET_REPO=${{ env.TARGET_REPO }}
+          LATEST_TAG=${{ env.LATEST_TAG }}
+          MAX_ROUND=${{ env.MAX_RETRY_ROUNDS }}
+          DELAY=${{ env.PER_RELEASE_DELAY }}
+          ROUND=1
+          while [ $ROUND -le $MAX_ROUND ]; do
+            if [ ! -s failed_tags.txt ]; then
+              echo -e "\n✅ 全部Release同步完成，无失败版本"
+              break
+            fi
+            sort -u failed_tags.txt > _tmp_sort.txt
+            sed '/^$/d' _tmp_sort.txt > retry_tags.txt
+            rm -f _tmp_sort.txt
+            REMAIN=$(wc -l < retry_tags.txt)
+            echo -e "\n=====【第 $ROUND 轮重试，剩余失败TAG数量: $REMAIN】====="
+            while read -r TAG; do
+              [ -z "$TAG" ] && continue
+              echo -e "\n===== 重试 TAG: $TAG ====="
+              REL=$(jq -c ".[] | select(.tag_name == \"$TAG\")" releases.json)
+              if [ -z "$REL" ]; then
+                echo "⚠️ 在上游Release列表找不到 $TAG，永久失败，移出列表"
+                grep -vxF "$TAG" failed_tags.txt > tmp_failed && mv tmp_failed failed_tags.txt
+                continue
+              fi
+              NAME=$(echo "$REL" | jq -r '.name')
+              BODY=$(echo "$REL" | jq -r '.body')
+              PRERELEASE=$(echo "$REL" | jq -r '.prerelease')
+              HAS_ASSETS=$(echo "$REL" | jq -r '.assets | length > 0')
+              ASSETS_RAW=$(echo "$REL" | jq -c '.assets | select(length >0) | .[]')
+              if [ "$TAG" != "$LATEST_TAG" ]; then
+                echo "ℹ️ $TAG 不是最新tag，仅检查tag是否存在"
+                if git_tag_exists "$TAG"; then
+                  echo "✅ $TAG 已存在，移除失败列表"
+                  grep -vxF "$TAG" failed_tags.txt > tmp_failed && mv tmp_failed failed_tags.txt
+                  continue
+                fi
+              else
+                echo "🔥 $TAG 是最新TAG，重试时执行差异校验"
+                UPSTREAM_ASSET_SIGN=$(echo "$REL" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
+                TAG_EXISTS=0
+                if git_tag_exists "$TAG"; then
+                  TAG_EXISTS=1
+                  TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
+                  TARGET_BODY=$(echo "$TARGET_REL" | jq -r '.body')
+                  TARGET_ASSET_SIGN=$(echo "$TARGET_REL" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
+                  if [ "$BODY" = "$TARGET_BODY" ] && [ "$UPSTREAM_ASSET_SIGN" = "$TARGET_ASSET_SIGN" ]; then
+                    echo "✅ 最新TAG内容已同步，移除失败列表"
+                    grep -vxF "$TAG" failed_tags.txt > tmp_failed && mv tmp_failed failed_tags.txt
+                    continue
+                  fi
+                  echo "🔍 最新TAG存在差异，重试更新"
+                fi
+              fi
+              RELEASE_OK=0
+              release_args=("$TAG" --title "$NAME" --notes-file -)
+              if [ "$PRERELEASE" = "true" ];then
+                release_args+=(--prerelease)
+              fi
+              if [ "$TAG" = "$LATEST_TAG" ]; then
+                if git_tag_exists "$TAG"; then
+                  TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
+                  echo "$TARGET_REL" | jq -r '.assets[].url' | while read -r ASSET_URL; do
+                    gh api --method DELETE "$ASSET_URL"
+                  done
+                  if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                    RELEASE_OK=1
+                  fi
+                else
+                  if echo "$BODY" | gh release create "${release_args[@]}"; then
+                    RELEASE_OK=1
+                  fi
+                fi
+              else
+                if echo "$BODY" | gh release create "${release_args[@]}"; then
+                  RELEASE_OK=1
+                fi
+              fi
+              if [ "$RELEASE_OK" -ne 1 ]; then
+                echo "❌ 重试创建/更新Release本体失败，保留到下一轮重试"
+                continue
+              fi
+              DL_OK=1
+              if [ "$HAS_ASSETS" = "true" ]; then
+                while read -r asset; do
+                  [ -z "$asset" ] && continue
+                  SPACE_AVAIL=$(df -P . | awk 'NR==2 {print $4*512/1024/1024}')
+                  SPACE_AVAIL=${SPACE_AVAIL:-0}
+                  echo "当前可用磁盘: ${SPACE_AVAIL} MB"
+                  if (( $(echo "$SPACE_AVAIL < 2048" | bc -l) )); then
+                    echo "❌ 磁盘不足，终止当前TAG重试"
+                    DL_OK=0
+                    break
+                  fi
+                  FNAME=$(echo "$asset" | jq -r '.name')
+                  DL_URL=$(echo "$asset" | jq -r '.browser_download_url')
+                  SRC_SIZE=$(echo "$asset" | jq -r '.size')
+                  echo "重试下载: $FNAME | 上游大小: $SRC_SIZE bytes"
+                  if ! curl --retry 3 --retry-delay 5 --connect-timeout 60 --max-time 1800 -L -O "$DL_URL"; then
+                    echo "❌ curl下载失败"
+                    DL_OK=0
+                    rm -f "$FNAME"
+                    continue
+                  fi
+                  LOCAL_SIZE=$(stat -c %s "$FNAME" 2>/dev/null || echo 0)
+                  if [ "$LOCAL_SIZE" != "$SRC_SIZE" ]; then
+                    echo "❌ $FNAME 文件大小校验失败"
+                    DL_OK=0
+                    rm -f "$FNAME"
+                    continue
+                  fi
+                  if ! gh release upload --clobber "$TAG" "$FNAME"; then
+                    echo "❌ gh upload失败"
+                    DL_OK=0
+                  fi
+                  echo "✅ $FNAME 重试上传完成，删除本地文件"
+                  rm -f "$FNAME"
+                done < <(echo "$ASSETS_RAW")
+              fi
+              if [ "$DL_OK" -eq 1 ]; then
+                echo "🎉 TAG $TAG 重试全部成功，移出失败列表"
+                grep -vxF "$TAG" failed_tags.txt > tmp_failed && mv tmp_failed failed_tags.txt
+              else
+                echo "⚠️ TAG $TAG 重试附件仍失败，保留到下一轮"
+              fi
+              echo "⏳ 等待 ${DELAY}s 再处理下一个重试项"
+              sleep $DELAY
+            done < retry_tags.txt
+            ROUND=$((ROUND+1))
+          done
+          if [ -s failed_tags.txt ]; then
+            echo -e "\n⚠️ 任务结束，仍有无法处理的TAG列表："
+            cat failed_tags.txt
+            echo "👉 下次手动运行或定时任务会继续尝试同步剩余版本"
+            echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+            echo "❌ 部分TAG同步失败" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat failed_tags.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            rm -f failed_tags.txt page.json releases.json releases_all.json _tmp_sort.txt retry_tags.txt
+            rm -rf tmp_*
+            echo -e "\n🎉🎉🎉 全量同步完成，写入标记文件 .sync_done"
+            echo "completed" > .sync_done
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add -f .sync_done
+            if git diff --cached --quiet; then
+              echo "ℹ️ .sync_done 文件无变更，跳过commit，不生成空提交记录"
+            else
+              echo "ℹ️ 检测到变更，执行git提交"
+              git commit -m "Mark full sync finished"
+              git push
+            fi
+            echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+            echo "✅ 全量同步任务全部成功" >> $GITHUB_STEP_SUMMARY
+          fi
+      - name: 增量模式 - 优先调用/releases/latest获取最新Release
+        if: env.RUN_MODE == 'LATEST_ONLY'
+        run: |
+          set -o pipefail
+          trap 'rm -f page.json releases.json releases_all.json; rm -rf tmp_*' EXIT
+          eval "$GH_API_FUNC"
+          SRC_REPO=${{ env.SOURCE_REPO }}
+          TARGET_REPO=${{ env.TARGET_REPO }}
+          DELAY=${{ env.PER_RELEASE_DELAY }}
+          SKIP_DRAFT=${{ env.SKIP_DRAFT }}
+          echo "🔎 增量模式：优先请求 /releases/latest"
+          rel=$(gh_api "https://api.github.com/repos/$SRC_REPO/releases/latest")
+          if [ -z "$(echo "$rel" | jq -r '.tag_name')" ] || [ "$(echo "$rel" | jq -r '.tag_name')" = "null" ]; then
+            echo "⚠️ /releases/latest 无结果（上游可能只有预发布版本），降级分页拉取全部releases"
+            ALL_RELEASES=()
+            PAGE=1
+            while true; do
+              page_json=$(gh_api "https://api.github.com/repos/$SRC_REPO/releases?per_page=100&page=$PAGE")
+              CNT=$(echo "$page_json" | jq 'length')
+              if [ "$CNT" -eq 0 ]; then
+                break
+              fi
+              ALL_RELEASES+=("$page_json")
+              PAGE=$((PAGE+1))
+            done
+            releases_all_json=$(jq -s 'flatten' <<< "${ALL_RELEASES[*]}")
+            echo "$releases_all_json" > releases_all.json
+            if [ "$(jq 'length' releases_all.json)" -eq 0 ]; then
+              echo "⚠️ 上游仓库无任何Release，增量同步直接退出"
+              echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+              echo "ℹ️ 上游无Release，增量任务直接完成" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+            if [[ "${SKIP_DRAFT}" == "true" ]];then
+              jq 'map(select(.draft != true)) | sort_by(.published_at)' releases_all.json > releases.json
+            else
+              jq 'sort_by(.published_at)' releases_all.json > releases.json
+            fi
+            rel=$(jq -c 'last' releases.json)
+          fi
+          IS_DRAFT=$(echo "$rel" | jq -r '.draft')
+          if [[ "${SKIP_DRAFT}" == "true" && "$IS_DRAFT" == "true" ]];then
+            echo "ℹ️ 当前最新Release为草稿Draft，按配置跳过"
+            echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ 上游最新Release为Draft，跳过同步" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          TAG=$(echo "$rel" | jq -r '.tag_name')
+          NAME=$(echo "$rel" | jq -r '.name')
+          BODY=$(echo "$rel" | jq -r '.body')
+          IS_PRERELEASE=$(echo "$rel" | jq -r '.prerelease')
+          HAS_ASSETS=$(echo "$rel" | jq -r '(.assets | length) > 0')
+          ASSETS_RAW=$(echo "$rel" | jq -c '.assets')
+          echo -e "\n========== 增量模式：检测上游最新TAG: ${TAG} =========="
+          echo "Is prerelease: ${IS_PRERELEASE}"
+          UPSTREAM_ASSET_SIGN=$(echo "$rel" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
+          TAG_EXISTS=0
+          if git_tag_exists "${TAG}";then
+            echo "✅ ${TAG} Tag已存在，对比正文+资产"
+            TAG_EXISTS=1
+            target_rel=$(gh_api "https://api.github.com/repos/${TARGET_REPO}/releases/tags/${TAG}")
+            target_body=$(echo "$target_rel" | jq -r '.body')
+            TARGET_ASSET_SIGN=$(echo "$target_rel" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
+            if [[ "${BODY}" == "${target_body}" && "${UPSTREAM_ASSET_SIGN}" == "${TARGET_ASSET_SIGN}" ]];then
+              echo "✅ 内容完全一致，无需更新"
+              echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+              echo "✅ 增量校验完成：上游无更新" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            else
+              echo "🔍 检测到上游更新，准备更新release"
+            fi
+          else
+            echo "➕ Tag不存在，新建Release"
+          fi
+          release_args=("${TAG}" --title "${NAME}" --notes-file -)
+          if [ "$IS_PRERELEASE" = "true" ];then
+            release_args+=(--prerelease)
+          fi
+          if git_tag_exists "${TAG}";then
+            TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
+            echo "$TARGET_REL" | jq -r '.assets[].url' | while read -r ASSET_URL; do
+              gh api --method DELETE "$ASSET_URL"
+            done
+            if echo "$BODY" | gh release edit "${release_args[@]}"; then
+              echo "✅ Release信息更新成功"
+            else
+              echo "❌ 更新Release失败"
+              echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+              echo "❌ 增量更新Release本体失败" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          else
+            if echo "$BODY" | gh release create "${release_args[@]}"; then
+              echo "✅ Release创建成功"
+            else
+              echo "❌ 创建Release失败"
+              echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+              echo "❌ 增量新建Release本体失败" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          fi
+          if [[ "${HAS_ASSETS}" == "true" ]];then
+            while read -r asset;do
+              SPACE_AVAIL=$(df -P . | awk 'NR==2 {print $4*512/1024/1024}')
+              SPACE_AVAIL=${SPACE_AVAIL:-0}
+              echo "当前可用磁盘: ${SPACE_AVAIL} MB"
+              if (( $(echo "$SPACE_AVAIL < 2048" | bc -l) )); then
+                echo "❌ 磁盘空间不足，终止增量同步"
+                echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+                echo "❌ 磁盘不足中断增量任务" >> $GITHUB_STEP_SUMMARY
+                exit 1
+              fi
+              URL=$(echo "$asset" | jq -r '.browser_download_url')
+              FNAME=$(echo "$asset" | jq -r '.name')
+              SRC_SIZE=$(echo "$asset" | jq -r '.size')
+              echo "Download: ${FNAME}"
+              if ! curl --retry 3 --retry-delay 5 --connect-timeout 60 --max-time 1800 -L "${URL}" -o "${FNAME}"; then
+                echo "❌ curl下载失败"
+                rm -f "${FNAME}"
+                continue
+              fi
+              LOCAL_SIZE=$(stat -c %s "$FNAME" 2>/dev/null || echo 0)
+              if [ "$LOCAL_SIZE" != "$SRC_SIZE" ]; then
+                echo "❌ ${FNAME}下载大小不匹配，跳过"
+                rm -f "${FNAME}"
+                continue
+              fi
+              if ! gh release upload --clobber "${TAG}" "${FNAME}"; then
+                echo "❌ gh upload上传失败"
+              fi
+              echo "✅ ${FNAME}上传完成，删除本地文件"
+              rm -f "${FNAME}"
+            done < <(echo "$ASSETS_RAW" | jq -c '.[]')
+          fi
+          echo "🎉 增量模式处理完成"
+          echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+          echo "✅ 增量同步成功，已更新TAG: ${TAG}" >> $GITHUB_STEP_SUMMARY
+      - name: 📊 任务结束，最终磁盘状态统计
+        run: |
+          echo "====Workflow执行完毕，最终磁盘信息===="
+          df -h
+          echo "## Final Disk Info" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          df -h >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
