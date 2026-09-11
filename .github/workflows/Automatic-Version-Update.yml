@@ -70,6 +70,17 @@ jobs:
           done
           return 1
         }
+        # =========新增：检查tag是否已经绑定Release=========
+        release_exists_for_tag() {
+          local t="$1"
+          local resp
+          resp=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$t")
+          local tagName=$(echo "$resp" | jq -r '.tag_name // empty')
+          if [ -n "$tagName" ] && [ "$tagName" = "$t" ]; then
+            return 0
+          fi
+          return 1
+        }
     steps:
       - name: Checkout current repo
         uses: actions/checkout@v5
@@ -180,7 +191,7 @@ jobs:
           echo "✅ 按发布时间识别上游最新Release TAG: $LATEST_TAG"
           > failed_tags.txt
           echo "===== 全量同步【顺序：按发布时间 最早版本 → 最新版本】 ====="
-          echo "👉 规则：旧tag只要存在直接跳过，仅最新TAG执行差异对比，支持更新附件/正文"
+          echo "👉 规则：旧tag只要存在Release直接跳过，仅最新TAG执行差异对比，支持更新附件/正文"
           jq -c '.[]' releases.json | while read -r rel; do
             TAG=$(echo "$rel" | jq -r '.tag_name')
             NAME=$(echo "$rel" | jq -r '.name')
@@ -190,20 +201,22 @@ jobs:
             ASSETS_RAW=$(echo "$rel" | jq -c '.assets | select(length >0) | .[]')
             echo -e "\n========== 正在处理 TAG: $TAG =========="
             echo "Is prerelease: $PRERELEASE"
+
+            # =====【核心修复】判断逻辑：优先检查Release是否存在，而不是只看git tag
             if [ "$TAG" != "$LATEST_TAG" ]; then
-              echo "ℹ️ $TAG 不是上游最新版本，仅检查tag是否存在，不对比附件正文"
-              if git_tag_exists "$TAG"; then
-                echo "✅ $TAG 已存在，直接跳过"
+              echo "ℹ️ $TAG 不是上游最新版本，检查是否已有Release"
+              if release_exists_for_tag "$TAG"; then
+                echo "✅ $TAG 已有Release，直接跳过"
                 sleep $DELAY
                 continue
               fi
-              echo "➕ $TAG 不存在，新建Release"
+              echo "➕ $TAG 无Release，准备创建"
             else
               echo "🔥 $TAG 是上游最新版本，执行完整差异校验（正文+附件）"
               UPSTREAM_ASSET_SIGN=$(echo "$rel" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
-              TAG_EXISTS=0
-              if git_tag_exists "$TAG"; then
-                TAG_EXISTS=1
+              REL_EXISTS=0
+              if release_exists_for_tag "$TAG"; then
+                REL_EXISTS=1
                 TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
                 TARGET_BODY=$(echo "$TARGET_REL" | jq -r '.body')
                 TARGET_ASSET_SIGN=$(echo "$TARGET_REL" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
@@ -215,13 +228,15 @@ jobs:
                 echo "🔍 最新TAG检测变更，准备更新Release"
               fi
             fi
+
             RELEASE_CREATED=0
             release_args=("$TAG" --title "$NAME" --notes-file -)
             if [ "$PRERELEASE" = "true" ];then
               release_args+=(--prerelease)
             fi
+
             if [ "$TAG" = "$LATEST_TAG" ]; then
-              if git_tag_exists "$TAG"; then
+              if release_exists_for_tag "$TAG"; then
                 echo "🔧 更新已有最新Release $TAG，清空旧附件"
                 TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
                 echo "$TARGET_REL" | jq -r '.assets[].url' | while read -r ASSET_URL; do
@@ -235,6 +250,35 @@ jobs:
                 fi
               else
                 echo "➕ 创建最新Release $TAG"
+                # 分支：git tag存在但无Release → 使用edit创建；不存在则create
+                if git_tag_exists "$TAG"; then
+                  echo "ℹ️ 仓库已有git tag $TAG，但无Release，使用 gh release edit 创建"
+                  if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                    echo "✅ Release创建成功(基于已有git tag)"
+                    RELEASE_CREATED=1
+                  else
+                    echo "❌ 创建Release基础信息失败"
+                  fi
+                else
+                  if echo "$BODY" | gh release create "${release_args[@]}"; then
+                    echo "✅ Release创建成功"
+                    RELEASE_CREATED=1
+                  else
+                    echo "❌ 创建Release基础信息失败"
+                  fi
+                fi
+              fi
+            else
+              echo "➕ 创建Release $TAG"
+              if git_tag_exists "$TAG"; then
+                echo "ℹ️ 仓库已有git tag $TAG，但无Release，使用 gh release edit 创建"
+                if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                  echo "✅ Release创建成功(基于已有git tag)"
+                  RELEASE_CREATED=1
+                else
+                  echo "❌ 创建Release基础信息失败"
+                fi
+              else
                 if echo "$BODY" | gh release create "${release_args[@]}"; then
                   echo "✅ Release创建成功"
                   RELEASE_CREATED=1
@@ -242,15 +286,8 @@ jobs:
                   echo "❌ 创建Release基础信息失败"
                 fi
               fi
-            else
-              echo "➕ 创建Release $TAG"
-              if echo "$BODY" | gh release create "${release_args[@]}"; then
-                echo "✅ Release创建成功"
-                RELEASE_CREATED=1
-              else
-                echo "❌ 创建Release基础信息失败"
-              fi
             fi
+
             if [ "$RELEASE_CREATED" -ne 1 ]; then
               echo "⚠️ $TAG Release本体创建失败，加入失败列表"
               echo "$TAG" >> failed_tags.txt
@@ -341,19 +378,20 @@ jobs:
               PRERELEASE=$(echo "$REL" | jq -r '.prerelease')
               HAS_ASSETS=$(echo "$REL" | jq -r '.assets | length > 0')
               ASSETS_RAW=$(echo "$REL" | jq -c '.assets | select(length >0) | .[]')
+
               if [ "$TAG" != "$LATEST_TAG" ]; then
-                echo "ℹ️ $TAG 不是最新tag，仅检查tag是否存在"
-                if git_tag_exists "$TAG"; then
-                  echo "✅ $TAG 已存在，移除失败列表"
+                echo "ℹ️ $TAG 不是最新tag，检查是否已有Release"
+                if release_exists_for_tag "$TAG"; then
+                  echo "✅ $TAG 已有Release，移除失败列表"
                   grep -vxF "$TAG" failed_tags.txt > tmp_failed && mv tmp_failed failed_tags.txt
                   continue
                 fi
               else
                 echo "🔥 $TAG 是最新TAG，重试时执行差异校验"
                 UPSTREAM_ASSET_SIGN=$(echo "$REL" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
-                TAG_EXISTS=0
-                if git_tag_exists "$TAG"; then
-                  TAG_EXISTS=1
+                REL_EXISTS=0
+                if release_exists_for_tag "$TAG"; then
+                  REL_EXISTS=1
                   TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
                   TARGET_BODY=$(echo "$TARGET_REL" | jq -r '.body')
                   TARGET_ASSET_SIGN=$(echo "$TARGET_REL" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
@@ -365,13 +403,15 @@ jobs:
                   echo "🔍 最新TAG存在差异，重试更新"
                 fi
               fi
+
               RELEASE_OK=0
               release_args=("$TAG" --title "$NAME" --notes-file -)
               if [ "$PRERELEASE" = "true" ];then
                 release_args+=(--prerelease)
               fi
+
               if [ "$TAG" = "$LATEST_TAG" ]; then
-                if git_tag_exists "$TAG"; then
+                if release_exists_for_tag "$TAG"; then
                   TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
                   echo "$TARGET_REL" | jq -r '.assets[].url' | while read -r ASSET_URL; do
                     gh api --method DELETE "$ASSET_URL"
@@ -380,15 +420,34 @@ jobs:
                     RELEASE_OK=1
                   fi
                 else
-                  if echo "$BODY" | gh release create "${release_args[@]}"; then
-                    RELEASE_OK=1
+                  if git_tag_exists "$TAG"; then
+                    echo "ℹ️ 已有git tag，使用 gh release edit 创建Release"
+                    if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                      RELEASE_OK=1
+                    fi
+                  else
+                    if echo "$BODY" | gh release create "${release_args[@]}"; then
+                      RELEASE_OK=1
+                    fi
                   fi
                 fi
               else
-                if echo "$BODY" | gh release create "${release_args[@]}"; then
+                if release_exists_for_tag "$TAG"; then
                   RELEASE_OK=1
+                else
+                  if git_tag_exists "$TAG"; then
+                    echo "ℹ️ 已有git tag，使用 gh release edit 创建Release"
+                    if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                      RELEASE_OK=1
+                    fi
+                  else
+                    if echo "$BODY" | gh release create "${release_args[@]}"; then
+                      RELEASE_OK=1
+                    fi
+                  fi
                 fi
               fi
+
               if [ "$RELEASE_OK" -ne 1 ]; then
                 echo "❌ 重试创建/更新Release本体失败，保留到下一轮重试"
                 continue
@@ -525,10 +584,10 @@ jobs:
           echo -e "\n========== 增量模式：检测上游最新TAG: ${TAG} =========="
           echo "Is prerelease: ${IS_PRERELEASE}"
           UPSTREAM_ASSET_SIGN=$(echo "$rel" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
-          TAG_EXISTS=0
-          if git_tag_exists "${TAG}";then
-            echo "✅ ${TAG} Tag已存在，对比正文+资产"
-            TAG_EXISTS=1
+          REL_EXISTS=0
+          if release_exists_for_tag "${TAG}";then
+            echo "✅ ${TAG} 已有Release，对比正文+资产"
+            REL_EXISTS=1
             target_rel=$(gh_api "https://api.github.com/repos/${TARGET_REPO}/releases/tags/${TAG}")
             target_body=$(echo "$target_rel" | jq -r '.body')
             TARGET_ASSET_SIGN=$(echo "$target_rel" | jq -r '.assets[] | "\(.name)|\(.size)"' | sort)
@@ -541,13 +600,13 @@ jobs:
               echo "🔍 检测到上游更新，准备更新release"
             fi
           else
-            echo "➕ Tag不存在，新建Release"
+            echo "➕ 不存在Release，准备创建"
           fi
           release_args=("${TAG}" --title "${NAME}" --notes-file -)
           if [ "$IS_PRERELEASE" = "true" ];then
             release_args+=(--prerelease)
           fi
-          if git_tag_exists "${TAG}";then
+          if release_exists_for_tag "${TAG}";then
             TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
             echo "$TARGET_REL" | jq -r '.assets[].url' | while read -r ASSET_URL; do
               gh api --method DELETE "$ASSET_URL"
@@ -561,13 +620,25 @@ jobs:
               exit 1
             fi
           else
-            if echo "$BODY" | gh release create "${release_args[@]}"; then
-              echo "✅ Release创建成功"
+            if git_tag_exists "$TAG"; then
+              echo "ℹ️ 仓库已有git tag $TAG，使用 gh release edit 创建Release"
+              if echo "$BODY" | gh release edit "${release_args[@]}"; then
+                echo "✅ Release创建成功"
+              else
+                echo "❌ 创建Release失败"
+                echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+                echo "❌ 增量新建Release本体失败" >> $GITHUB_STEP_SUMMARY
+                exit 1
+              fi
             else
-              echo "❌ 创建Release失败"
-              echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
-              echo "❌ 增量新建Release本体失败" >> $GITHUB_STEP_SUMMARY
-              exit 1
+              if echo "$BODY" | gh release create "${release_args[@]}"; then
+                echo "✅ Release创建成功"
+              else
+                echo "❌ 创建Release失败"
+                echo "## Sync Result" >> $GITHUB_STEP_SUMMARY
+                echo "❌ 增量新建Release本体失败" >> $GITHUB_STEP_SUMMARY
+                exit 1
+              fi
             fi
           fi
           if [[ "${HAS_ASSETS}" == "true" ]];then
