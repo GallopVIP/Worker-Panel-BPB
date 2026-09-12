@@ -194,14 +194,14 @@ jobs:
           echo "👉 规则：旧tag只要存在Release直接跳过，仅最新TAG执行差异对比，支持更新附件/正文"
           jq -c '.[]' releases.json | while read -r rel; do
             TAG=$(echo "$rel" | jq -r '.tag_name')
-            NAME=$(echo "$rel" | jq -r '.name')
+            # ==========【修复】强制使用tag_name作为Release标题，不再读取上游.name==========
+            NAME=$(echo "$rel" | jq -r '.tag_name')
             BODY=$(echo "$rel" | jq -r '.body')
             PRERELEASE=$(echo "$rel" | jq -r '.prerelease')
             HAS_ASSETS=$(echo "$rel" | jq -r '.assets | length > 0')
             ASSETS_RAW=$(echo "$rel" | jq -c '.assets | select(length >0) | .[]')
             echo -e "\n========== 正在处理 TAG: $TAG =========="
             echo "Is prerelease: $PRERELEASE"
-
             # =====【核心修复】判断逻辑：优先检查Release是否存在，而不是只看git tag
             if [ "$TAG" != "$LATEST_TAG" ]; then
               echo "ℹ️ $TAG 不是上游最新版本，检查是否已有Release"
@@ -228,13 +228,11 @@ jobs:
                 echo "🔍 最新TAG检测变更，准备更新Release"
               fi
             fi
-
             RELEASE_CREATED=0
             release_args=("$TAG" --title "$NAME" --notes-file -)
             if [ "$PRERELEASE" = "true" ];then
               release_args+=(--prerelease)
             fi
-
             if [ "$TAG" = "$LATEST_TAG" ]; then
               if release_exists_for_tag "$TAG"; then
                 echo "🔧 更新已有最新Release $TAG，清空旧附件"
@@ -287,7 +285,6 @@ jobs:
                 fi
               fi
             fi
-
             if [ "$RELEASE_CREATED" -ne 1 ]; then
               echo "⚠️ $TAG Release本体创建失败，加入失败列表"
               echo "$TAG" >> failed_tags.txt
@@ -373,12 +370,12 @@ jobs:
                 grep -vxF "$TAG" failed_tags.txt > tmp_failed && mv tmp_failed failed_tags.txt
                 continue
               fi
-              NAME=$(echo "$REL" | jq -r '.name')
+              # =========【修复】强制使用tag_name作为Release标题=========
+              NAME=$(echo "$REL" | jq -r '.tag_name')
               BODY=$(echo "$REL" | jq -r '.body')
               PRERELEASE=$(echo "$REL" | jq -r '.prerelease')
               HAS_ASSETS=$(echo "$REL" | jq -r '.assets | length > 0')
               ASSETS_RAW=$(echo "$REL" | jq -c '.assets | select(length >0) | .[]')
-
               if [ "$TAG" != "$LATEST_TAG" ]; then
                 echo "ℹ️ $TAG 不是最新tag，检查是否已有Release"
                 if release_exists_for_tag "$TAG"; then
@@ -403,13 +400,11 @@ jobs:
                   echo "🔍 最新TAG存在差异，重试更新"
                 fi
               fi
-
               RELEASE_OK=0
               release_args=("$TAG" --title "$NAME" --notes-file -)
               if [ "$PRERELEASE" = "true" ];then
                 release_args+=(--prerelease)
               fi
-
               if [ "$TAG" = "$LATEST_TAG" ]; then
                 if release_exists_for_tag "$TAG"; then
                   TARGET_REL=$(gh_api "https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG")
@@ -447,7 +442,6 @@ jobs:
                   fi
                 fi
               fi
-
               if [ "$RELEASE_OK" -ne 1 ]; then
                 echo "❌ 重试创建/更新Release本体失败，保留到下一轮重试"
                 continue
@@ -576,7 +570,8 @@ jobs:
             exit 0
           fi
           TAG=$(echo "$rel" | jq -r '.tag_name')
-          NAME=$(echo "$rel" | jq -r '.name')
+          # ==========【修复】强制使用tag_name作为Release标题==========
+          NAME=$(echo "$rel" | jq -r '.tag_name')
           BODY=$(echo "$rel" | jq -r '.body')
           IS_PRERELEASE=$(echo "$rel" | jq -r '.prerelease')
           HAS_ASSETS=$(echo "$rel" | jq -r '(.assets | length) > 0')
